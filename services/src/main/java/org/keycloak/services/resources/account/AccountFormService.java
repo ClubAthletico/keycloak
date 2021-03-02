@@ -16,6 +16,8 @@
  */
 package org.keycloak.services.resources.account;
 
+import static org.keycloak.userprofile.profile.UserProfileContextFactory.forOldAccount;
+
 import org.jboss.logging.Logger;
 import org.keycloak.authorization.AuthorizationProvider;
 import org.keycloak.authorization.model.PermissionTicket;
@@ -63,20 +65,17 @@ import org.keycloak.services.managers.AppAuthManager;
 import org.keycloak.services.managers.Auth;
 import org.keycloak.services.managers.AuthenticationManager;
 import org.keycloak.services.managers.AuthenticationSessionManager;
+import org.keycloak.services.managers.UserConsentManager;
 import org.keycloak.services.managers.UserSessionManager;
 import org.keycloak.services.messages.Messages;
 import org.keycloak.services.resources.AbstractSecuredLocalService;
-import org.keycloak.services.resources.AttributeFormDataProcessor;
 import org.keycloak.services.resources.RealmsResource;
 import org.keycloak.services.util.ResolveRelative;
 import org.keycloak.services.validation.Validation;
 import org.keycloak.sessions.AuthenticationSessionModel;
 import org.keycloak.storage.ReadOnlyException;
-import org.keycloak.userprofile.LegacyUserProfileProviderFactory;
-import org.keycloak.userprofile.UserProfileProvider;
-import org.keycloak.userprofile.profile.representations.AttributeUserProfile;
+import org.keycloak.userprofile.UserProfile;
 import org.keycloak.userprofile.utils.UserUpdateHelper;
-import org.keycloak.userprofile.profile.DefaultUserProfileContext;
 import org.keycloak.userprofile.validation.UserProfileValidationResult;
 import org.keycloak.util.JsonSerialization;
 import org.keycloak.utils.CredentialHelper;
@@ -365,15 +364,11 @@ public class AccountFormService extends AbstractSecuredLocalService {
         csrfCheck(formData);
 
         UserModel user = auth.getUser();
-        AttributeUserProfile updatedProfile = AttributeFormDataProcessor.toUserProfile(formData);
         String oldEmail = user.getEmail();
-        String newEmail = updatedProfile.getAttributes().getFirstAttribute(UserModel.EMAIL);
 
         event.event(EventType.UPDATE_PROFILE).client(auth.getClient()).user(auth.getUser());
 
-        UserProfileProvider profileProvider = session.getProvider(UserProfileProvider.class, LegacyUserProfileProviderFactory.PROVIDER_ID);
-
-        UserProfileValidationResult result = profileProvider.validate(DefaultUserProfileContext.forAccountService(user), updatedProfile);
+        UserProfileValidationResult result = forOldAccount(user, formData, session).validate();
         List<FormMessage> errors = Validation.getFormErrorsFromValidation(result);
 
         if (!errors.isEmpty()) {
@@ -389,8 +384,12 @@ public class AccountFormService extends AbstractSecuredLocalService {
             return account.setErrors(status, errors).setProfileFormData(formData).createResponse(AccountPages.ACCOUNT);
         }
 
+        UserProfile updatedProfile = result.getProfile();
+        String newEmail = updatedProfile.getAttributes().getFirstAttribute(UserModel.EMAIL);
+
         try {
-            UserUpdateHelper.updateAccount(realm, user, updatedProfile);
+            // backward compatibility with old account console where attributes are not removed if missing
+            UserUpdateHelper.updateAccountOldConsole(realm, user, updatedProfile);
         } catch (ReadOnlyException e) {
             setReferrerOnPage();
             return account.setError(Response.Status.BAD_REQUEST, Messages.READ_ONLY_USER).setProfileFormData(formData).createResponse(AccountPages.ACCOUNT);
@@ -467,11 +466,7 @@ public class AccountFormService extends AbstractSecuredLocalService {
 
         // Revoke grant in UserModel
         UserModel user = auth.getUser();
-        session.users().revokeConsentForClient(realm, user.getId(), client.getId());
-        new UserSessionManager(session).revokeOfflineToken(user, client);
-
-        // Logout clientSessions for this user and client
-        AuthenticationManager.backchannelLogoutUserFromClient(session, realm, user, client, session.getContext().getUri(), headers);
+        UserConsentManager.revokeConsentToClient(session, client, user);
 
         event.event(EventType.REVOKE_GRANT).client(auth.getClient()).user(auth.getUser()).detail(Details.REVOKED_CLIENT, client.getClientId()).success();
         setReferrerOnPage();
